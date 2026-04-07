@@ -22,6 +22,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from pprint import pformat
 from typing import Any, Generic, TypeVar
+from itertools import accumulate
 
 import datasets
 import numpy as np
@@ -47,7 +48,7 @@ from lerobot.datasets.backward_compatibility import (
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STR
 from lerobot.utils.utils import SuppressProgressBars, is_valid_numpy_dtype_string
 
-DEFAULT_CHUNK_SIZE = 1000  # Max number of files per chunk
+DEFAULT_CHUNK_SIZE = 100000  # Max number of files per chunk
 DEFAULT_DATA_FILE_SIZE_IN_MB = 100  # Max size per file
 DEFAULT_VIDEO_FILE_SIZE_IN_MB = 500  # Max size per file
 
@@ -63,7 +64,7 @@ DEFAULT_TASKS_PATH = "meta/tasks.parquet"
 DEFAULT_EPISODES_PATH = EPISODES_DIR + "/" + CHUNK_FILE_PATTERN + ".parquet"
 DEFAULT_DATA_PATH = DATA_DIR + "/" + CHUNK_FILE_PATTERN + ".parquet"
 DEFAULT_VIDEO_PATH = VIDEO_DIR + "/{video_key}/" + CHUNK_FILE_PATTERN + ".mp4"
-DEFAULT_IMAGE_PATH = "images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}.png"
+DEFAULT_IMAGE_PATH = "images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}.jpeg"
 
 LEGACY_EPISODES_PATH = "meta/episodes.jsonl"
 LEGACY_EPISODES_STATS_PATH = "meta/episodes_stats.jsonl"
@@ -74,7 +75,11 @@ DEFAULT_FEATURES = {
     "frame_index": {"dtype": "int64", "shape": (1,), "names": None},
     "episode_index": {"dtype": "int64", "shape": (1,), "names": None},
     "index": {"dtype": "int64", "shape": (1,), "names": None},
+    "coarse_task_index": {"dtype": "int64", "shape": (1,), "names": None}, 
     "task_index": {"dtype": "int64", "shape": (1,), "names": None},
+    "coarse_quality_index": {"dtype": "int64", "shape": (1,), "names": None}, 
+    "quality_index": {"dtype": "int64", "shape": (1,), "names": None},
+    "operating_hand_index": {"dtype": "int64", "shape": (1,), "names": None},
 }
 
 T = TypeVar("T")
@@ -382,6 +387,20 @@ def load_episodes(local_dir: Path) -> datasets.Dataset:
     # This is to speedup access to these data, instead of having to load episode stats.
     episodes = episodes.select_columns([key for key in episodes.features if not key.startswith("stats/")])
     return episodes
+
+def get_episode_data_index(
+    episode_dicts: dict[dict], episodes: list[int] | None = None
+) -> dict[str, torch.Tensor]:
+    episode_lengths = {ep_idx: ep_dict["length"] for ep_idx, ep_dict in episode_dicts.items()}
+    if episodes is not None:
+        episode_lengths = {ep_idx: episode_lengths[ep_idx] for ep_idx in episodes}
+
+    cumulative_lengths = list(accumulate(episode_lengths.values()))
+    return {
+        "from": torch.LongTensor([0] + cumulative_lengths[:-1]),
+        "to": torch.LongTensor(cumulative_lengths),
+    }
+
 
 
 def load_image_as_numpy(
@@ -989,9 +1008,10 @@ def validate_frame(frame: dict, features: dict) -> None:
     actual_features = set(frame)
 
     # task is a special required field that's not part of regular features
+    '''
     if "task" not in actual_features:
         raise ValueError("Feature mismatch in `frame` dictionary:\nMissing features: {'task'}\n")
-
+    '''
     # Remove task from actual_features for regular feature validation
     actual_features_for_validation = actual_features - {"task"}
 
@@ -1030,7 +1050,7 @@ def validate_features_presence(actual_features: set[str], expected_features: set
 
 
 def validate_feature_dtype_and_shape(
-    name: str, feature: dict, value: np.ndarray | PILImage.Image | str
+    name: str, feature: dict, value: np.ndarray | PILImage.Image | str | bytes
 ) -> str:
     """Validate the dtype and shape of a single feature's value.
 
@@ -1045,6 +1065,11 @@ def validate_feature_dtype_and_shape(
     Raises:
         NotImplementedError: If the feature dtype is not supported for validation.
     """
+    import array
+    if isinstance(value, bytes) or isinstance(value, array.array): # ROS 1 and 2
+        #TODO fix bytes
+        return ""
+
     expected_dtype = feature["dtype"]
     expected_shape = feature["shape"]
     if is_valid_numpy_dtype_string(expected_dtype):

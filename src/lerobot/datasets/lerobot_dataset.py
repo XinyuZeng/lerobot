@@ -19,6 +19,10 @@ import shutil
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
+from typing import Callable, List, Literal, Dict
+import psutil
+import time
+import os 
 
 import datasets
 import numpy as np
@@ -78,6 +82,35 @@ from lerobot.utils.constants import HF_LEROBOT_HOME
 
 CODEBASE_VERSION = "v3.0"
 
+def get_memory_usage() -> Dict[str, float]:
+    """
+    获取当前进程/系统的内存使用情况（适配多进程）
+    返回：字典包含进程内存、系统可用内存、系统已用内存（单位：MB）
+    """
+    # 当前进程内存
+    process = psutil.Process(os.getpid())
+    proc_mem = process.memory_info()
+    # 系统内存
+    sys_mem = psutil.virtual_memory()
+    
+    return {
+        "pid": os.getpid(),  # 进程ID，多进程下区分
+        "process_rss_mb": round(proc_mem.rss / 1024 / 1024, 2),  # 物理内存（重点关注）
+        "process_vms_mb": round(proc_mem.vms / 1024 / 1024, 2),  # 虚拟内存
+        "sys_used_mb": round(sys_mem.used / 1024 / 1024, 2),     # 系统已用内存
+        "sys_available_mb": round(sys_mem.available / 1024 / 1024, 2),  # 系统可用内存
+        "sys_used_percent": round(sys_mem.percent, 2)            # 系统内存使用率
+    }
+
+def log_memory_status(stage: str, video_key: str, episode_index: int):
+    """用print输出内存状态（替代logger）"""
+    mem_info = get_memory_usage()
+    # 格式化输出，便于阅读（多进程下PID是关键区分标识）
+    print(f"\n=== [{time.strftime('%Y-%m-%d %H:%M:%S')}] [PID:{mem_info['pid']}] 内存监控 - {stage} ===")
+    print(f"视频Key: {video_key} | 片段索引: {episode_index}")
+    print(f"进程内存：物理={mem_info['process_rss_mb']}MB | 虚拟={mem_info['process_vms_mb']}MB")
+    print(f"系统内存：已用={mem_info['sys_used_mb']}MB ({mem_info['sys_used_percent']}%) | 可用={mem_info['sys_available_mb']}MB")
+    print("="*80)
 
 class LeRobotDatasetMetadata:
     def __init__(
@@ -1021,6 +1054,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Add task as a string
         task_idx = item["task_index"].item()
         item["task"] = self.meta.tasks.iloc[task_idx].name
+        if "coarse_task_index" in item:
+            coarse_task_index = item["coarse_task_index"].item()
+            item["coarse_task"] = self.meta.tasks.iloc[coarse_task_index].name
+        if "operating_hand_index" in item:
+            operating_hand_index = item["operating_hand_index"].item()
+            item["operating_hand"] = self.meta.tasks.iloc[operating_hand_index].name
         return item
 
     def __repr__(self):
@@ -1061,7 +1100,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def _get_image_file_dir(self, episode_index: int, image_key: str) -> Path:
         return self._get_image_file_path(episode_index, image_key, frame_index=0).parent
 
-    def _save_image(self, image: torch.Tensor | np.ndarray | PIL.Image.Image, fpath: Path) -> None:
+    def _save_image(self, image: torch.Tensor | np.ndarray | PIL.Image.Image | bytes, fpath: Path) -> None:
         if self.image_writer is None:
             if isinstance(image, torch.Tensor):
                 image = image.cpu().numpy()
@@ -1069,7 +1108,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         else:
             self.image_writer.save_image(image=image, fpath=fpath)
 
-    def add_frame(self, frame: dict) -> None:
+    def add_frame(self, frame: dict, task: List[str], timestamp: float | None = None) -> None:
         """
         This function only adds the frame to the episode_buffer. Apart from images — which are written in a
         temporary directory — nothing is written to disk. To save those frames, the 'save_episode()' method
@@ -1090,7 +1129,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         timestamp = frame.pop("timestamp") if "timestamp" in frame else frame_index / self.fps
         self.episode_buffer["frame_index"].append(frame_index)
         self.episode_buffer["timestamp"].append(timestamp)
-        self.episode_buffer["task"].append(frame.pop("task"))  # Remove task from frame after processing
+        self.episode_buffer["task"].append(task)  # Remove task from frame after processing
 
         # Add frame features to episode_buffer
         for key in frame:
@@ -1132,7 +1171,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # size and task are special cases that won't be added to hf_dataset
         episode_length = episode_buffer.pop("size")
         tasks = episode_buffer.pop("task")
-        episode_tasks = list(set(tasks))
+        episode_tasks = list(set([item for sublist in tasks for item in sublist]))
         episode_index = episode_buffer["episode_index"]
 
         episode_buffer["index"] = np.arange(self.meta.total_frames, self.meta.total_frames + episode_length)
@@ -1142,18 +1181,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.meta.save_episode_tasks(episode_tasks)
 
         # Given tasks in natural language, find their corresponding task indices
-        episode_buffer["task_index"] = np.array([self.meta.get_task_index(task) for task in tasks])
+        episode_buffer["coarse_task_index"] = np.array([self.meta.get_task_index(task[0]) for task in tasks])
+        episode_buffer["task_index"] = np.array([self.meta.get_task_index(task[1]) for task in tasks])
+        episode_buffer["coarse_quality_index"] = np.array([self.meta.get_task_index(task[2]) for task in tasks])
+        episode_buffer["quality_index"] = np.array([self.meta.get_task_index(task[3]) for task in tasks])
+        episode_buffer["operating_hand_index"] = np.array([self.meta.get_task_index(task[4]) for task in tasks])
 
         for key, ft in self.features.items():
             # index, episode_index, task_index are already processed above, and image and video
             # are processed separately by storing image path and frame info as meta data
-            if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
+            if key in ["index", "episode_index", "coarse_task_index", "task_index", "coarse_quality_index", "quality_index", "operating_hand_index"] or ft["dtype"] in ["image", "video"]:
                 continue
             episode_buffer[key] = np.stack(episode_buffer[key])
 
         # Wait for image writer to end, so that episode stats over images can be computed
         self._wait_image_writer()
-        ep_stats = compute_episode_stats(episode_buffer, self.features)
+        ep_stats = compute_episode_stats(episode_buffer, self.features, is_compute_episode_stats_image=False)
 
         ep_metadata = self._save_episode_data(episode_buffer)
         has_video_keys = len(self.meta.video_keys) > 0
@@ -1248,9 +1291,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Convert buffer into HF Dataset
         ep_dict = {key: episode_buffer[key] for key in self.hf_features}
         ep_dataset = datasets.Dataset.from_dict(ep_dict, features=self.hf_features, split="train")
-        ep_dataset = embed_images(ep_dataset)
         ep_num_frames = len(ep_dataset)
-
+        ep_dataset = embed_images(ep_dataset)
         if self.latest_episode is None:
             # Initialize indices and frame count for a new dataset made of the first episode data
             chunk_idx, file_idx = 0, 0
@@ -1326,11 +1368,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         return metadata
 
+
     def _save_episode_video(self, video_key: str, episode_index: int) -> dict:
+        
         # Encode episode frames into a temporary video
         ep_path = self._encode_temporary_episode_video(video_key, episode_index)
         ep_size_in_mb = get_file_size_in_mb(ep_path)
         ep_duration_in_s = get_video_duration_in_s(ep_path)
+
 
         if (
             episode_index == 0
@@ -1352,7 +1397,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
             )
             new_path.parent.mkdir(parents=True, exist_ok=True)
+            
             shutil.move(str(ep_path), str(new_path))
+            
         else:
             # Retrieve information from the latest updated video file using latest_episode
             latest_ep = self.meta.latest_episode
@@ -1372,15 +1419,18 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
                 )
                 new_path.parent.mkdir(parents=True, exist_ok=True)
+                
                 shutil.move(str(ep_path), str(new_path))
+                
                 latest_duration_in_s = 0.0
             else:
+                
                 # Update latest video file
                 concatenate_video_files(
                     [latest_path, ep_path],
                     latest_path,
                 )
-
+        
         # Remove temporary directory
         shutil.rmtree(str(ep_path.parent))
 
@@ -1396,22 +1446,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
             f"videos/{video_key}/from_timestamp": latest_duration_in_s,
             f"videos/{video_key}/to_timestamp": latest_duration_in_s + ep_duration_in_s,
         }
+        
         return metadata
 
     def clear_episode_buffer(self, delete_images: bool = True) -> None:
         # Clean up image files for the current episode buffer
-        if delete_images:
-            # Wait for the async image writer to finish
-            if self.image_writer is not None:
-                self._wait_image_writer()
-            episode_index = self.episode_buffer["episode_index"]
-            if isinstance(episode_index, np.ndarray):
-                episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
-            for cam_key in self.meta.camera_keys:
-                img_dir = self._get_image_file_dir(episode_index, cam_key)
-                if img_dir.is_dir():
-                    shutil.rmtree(img_dir)
-
         # Reset the buffer
         self.episode_buffer = self.create_episode_buffer()
 

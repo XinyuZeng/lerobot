@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import Any, ClassVar
+import subprocess
 
 import av
 import fsspec
@@ -314,17 +315,18 @@ def encode_video_frames(
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
     # Check encoder availability
+    if vcodec == "h264_nvenc" :
+        return encode_video_frames_ffmpeg(
+            imgs_dir, video_path, fps, pix_fmt = pix_fmt, overwrite=overwrite
+        )
+
     if vcodec not in ["h264", "hevc", "libsvtav1"]:
         raise ValueError(f"Unsupported video codec: {vcodec}. Supported codecs are: h264, hevc, libsvtav1.")
 
     video_path = Path(video_path)
     imgs_dir = Path(imgs_dir)
 
-    if video_path.exists() and not overwrite:
-        logging.warning(f"Video file already exists: {video_path}. Skipping encoding.")
-        return
-
-    video_path.parent.mkdir(parents=True, exist_ok=True)
+    video_path.parent.mkdir(parents=True, exist_ok=overwrite)
 
     # Encoders/pixel formats incompatibility check
     if (vcodec == "libsvtav1" or vcodec == "hevc") and pix_fmt == "yuv444p":
@@ -334,7 +336,7 @@ def encode_video_frames(
         pix_fmt = "yuv420p"
 
     # Get input frames
-    template = "frame-" + ("[0-9]" * 6) + ".png"
+    template = "frame-" + ("[0-9]" * 6) + ".jpeg"
     input_list = sorted(
         glob.glob(str(imgs_dir / template)), key=lambda x: int(x.split("-")[-1].split(".")[0])
     )
@@ -342,8 +344,8 @@ def encode_video_frames(
     # Define video output frame size (assuming all input frames are the same size)
     if len(input_list) == 0:
         raise FileNotFoundError(f"No images found in {imgs_dir}.")
-    with Image.open(input_list[0]) as dummy_image:
-        width, height = dummy_image.size
+    dummy_image = Image.open(input_list[0])
+    width, height = dummy_image.size
 
     # Define video codec options
     video_options = {}
@@ -358,10 +360,17 @@ def encode_video_frames(
         key = "svtav1-params" if vcodec == "libsvtav1" else "tune"
         value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
         video_options[key] = value
+    
+    # 仅新增这部分：给libsvtav1添加preset=4，不改动其他逻辑
+    if vcodec == "libsvtav1":
+        svt_params = ["preset=8"]
+        if "svtav1-params" in video_options:
+            svt_params.append(video_options["svtav1-params"])
+        video_options["svtav1-params"] = ":".join(svt_params)
 
     # Set logging level
     if log_level is not None:
-        # "While less efficient, it is generally preferable to modify logging with Python's logging"
+        # "While less efficient, it is generally preferable to modify logging with Python’s logging"
         logging.getLogger("libav").setLevel(log_level)
 
     # Create and open output file (overwrite by default)
@@ -370,15 +379,13 @@ def encode_video_frames(
         output_stream.pix_fmt = pix_fmt
         output_stream.width = width
         output_stream.height = height
-
         # Loop through input frames and encode them
         for input_data in input_list:
-            with Image.open(input_data) as input_image:
-                input_image = input_image.convert("RGB")
-                input_frame = av.VideoFrame.from_image(input_image)
-                packet = output_stream.encode(input_frame)
-                if packet:
-                    output.mux(packet)
+            input_image = Image.open(input_data).convert("RGB")
+            input_frame = av.VideoFrame.from_image(input_image)
+            packet = output_stream.encode(input_frame)
+            if packet:
+                output.mux(packet)
 
         # Flush the encoder
         packet = output_stream.encode()
@@ -393,6 +400,70 @@ def encode_video_frames(
         raise OSError(f"Video encoding did not work. File not found: {video_path}.")
 
 
+
+# GPU speed up video encoding
+def encode_video_frames_ffmpeg(
+    imgs_dir: Path | str,
+    video_path: Path | str,
+    fps: int,
+    vcodec: str = "h264_nvenc",
+    pix_fmt: str = "yuv420p",
+    g: int | None = 4,
+    crf: int | None = 30,
+    overwrite: bool = False,
+) -> None:
+    import subprocess
+    import shutil
+    
+    video_path = Path(video_path)
+    imgs_dir = Path(imgs_dir)
+    
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Check if ffmpeg is available
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is not installed or not in system PATH")
+    
+    # Build ffmpeg command
+    cmd = [
+        ffmpeg_path,
+        "-y" if overwrite else "-n",
+        "-framerate", str(fps),
+        "-pattern_type", "sequence",
+        "-i", str(imgs_dir / "frame-%06d.jpeg"),
+        "-vcodec", vcodec,
+        "-pix_fmt", pix_fmt,
+    ]
+    
+    if g is not None:
+        cmd.extend(["-g", str(g)])
+        
+    if crf is not None:
+        cmd.extend(["-crf", str(crf)])
+        
+    cmd.append(str(video_path))
+    
+    try:
+        result = subprocess.run(
+            cmd, 
+            capture_output=True, 
+            text=True, 
+            check=True
+        )
+    except subprocess.CalledProcessError as e:
+        error_msg = f"FFmpeg failed:\nCommand: {' '.join(cmd)}\nStdout: {e.stdout}\nStderr: {e.stderr}"
+        logging.error(error_msg)
+        logging.error(video_path)
+        logging.error(vcodec)
+        print(f"ffmpeg {' '.join(cmd)}")
+        raise RuntimeError(error_msg)
+    except Exception as e:
+        error_msg = f"Failed to run FFmpeg command: {' '.join(cmd)}\nError: {str(e)}"
+        logging.error(error_msg)
+        raise RuntimeError(error_msg)
+    
+    
 def concatenate_video_files(
     input_video_paths: list[Path | str], output_video_path: Path, overwrite: bool = True
 ):

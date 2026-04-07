@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import PIL.Image
 import torch
-
+import array
 
 def safe_stop_image_writer(func):
     def wrapper(*args, **kwargs):
@@ -68,7 +68,7 @@ def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) 
     return PIL.Image.fromarray(image_array)
 
 
-def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1):
+def write_image(image: np.ndarray | PIL.Image.Image | bytes, fpath: Path, compress_level: int = 1):
     """
     Saves a NumPy array or PIL Image to a file.
 
@@ -97,6 +97,10 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level
             img = image_array_to_pil_image(image)
         elif isinstance(image, PIL.Image.Image):
             img = image
+        elif isinstance(image, bytes) or isinstance(image, array.array): # ROS 1 and 2	
+            with open(fpath, 'wb') as f:	
+                f.write(image)
+            return
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
         img.save(fpath, compress_level=compress_level)
@@ -169,7 +173,7 @@ class AsyncImageWriter:
                 p.start()
                 self.processes.append(p)
 
-    def save_image(self, image: torch.Tensor | np.ndarray | PIL.Image.Image, fpath: Path):
+    def save_image(self, image: torch.Tensor | np.ndarray | PIL.Image.Image | bytes, fpath: Path):
         if isinstance(image, torch.Tensor):
             # Convert tensor to numpy array to minimize main process time
             image = image.cpu().numpy()

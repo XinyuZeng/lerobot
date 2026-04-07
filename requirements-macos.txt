@@ -114,7 +114,7 @@ coverage[toml]==7.11.0
     # via pytest-cov
 cycler==0.12.1
     # via matplotlib
-datasets==4.1.1
+datasets==3.6.0
     # via lerobot
 debugpy==1.8.17
     # via lerobot

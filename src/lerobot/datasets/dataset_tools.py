@@ -258,7 +258,8 @@ def merge_datasets(
         roots=roots,
         aggr_root=output_dir,
     )
-
+    return None # under Galaxea data generation pipeline, we do not need to return the merged dataset object
+    '''
     merged_dataset = LeRobotDataset(
         repo_id=output_repo_id,
         root=output_dir,
@@ -268,6 +269,7 @@ def merge_datasets(
     )
 
     return merged_dataset
+    '''
 
 
 def modify_features(

@@ -474,53 +474,26 @@ def get_feature_stats(
     return stats
 
 
-def compute_episode_stats(
-    episode_data: dict[str, list[str] | np.ndarray],
-    features: dict,
-    quantile_list: list[float] | None = None,
-) -> dict:
-    """Compute comprehensive statistics for all features in an episode.
-
-    Processes different data types appropriately:
-    - Images/videos: Samples from paths, computes per-channel stats, normalizes to [0,1]
-    - Numerical arrays: Computes per-feature statistics
-    - Strings: Skipped (no statistics computed)
-
-    Args:
-        episode_data: Dictionary mapping feature names to data
-            - For images/videos: list of file paths
-            - For numerical data: numpy arrays
-        features: Dictionary describing each feature's dtype and shape
-
-    Returns:
-        Dictionary mapping feature names to their statistics dictionaries.
-        Each statistics dictionary contains min, max, mean, std, count, and quantiles.
-
-    Note:
-        Image statistics are normalized to [0,1] range and have shape (3,1,1) for
-        per-channel values when dtype is 'image' or 'video'.
-    """
-    if quantile_list is None:
-        quantile_list = DEFAULT_QUANTILES
-
+def compute_episode_stats(episode_data: dict[str, list[str] | np.ndarray], features: dict, is_compute_episode_stats_image : bool) -> dict:
     ep_stats = {}
     for key, data in episode_data.items():
         if features[key]["dtype"] == "string":
-            continue
-
-        if features[key]["dtype"] in ["image", "video"]:
-            ep_ft_array = sample_images(data)
-            axes_to_reduce = (0, 2, 3)
-            keepdims = True
+            continue  # HACK: we should receive np.arrays of strings
+        elif features[key]["dtype"] in ["image", "video"]:
+            if is_compute_episode_stats_image:
+                ep_ft_array = sample_images(data)  # data is a list of image paths
+                axes_to_reduce = (0, 2, 3)  # keep channel dim
+                keepdims = True
+            else:
+                continue
         else:
-            ep_ft_array = data
-            axes_to_reduce = 0
-            keepdims = data.ndim == 1
+            ep_ft_array = data  # data is already a np.ndarray
+            axes_to_reduce = 0  # compute stats over the first axis
+            keepdims = data.ndim == 1  # keep as np.array
 
-        ep_stats[key] = get_feature_stats(
-            ep_ft_array, axis=axes_to_reduce, keepdims=keepdims, quantile_list=quantile_list
-        )
+        ep_stats[key] = get_feature_stats(ep_ft_array, axis=axes_to_reduce, keepdims=keepdims)
 
+        # finally, we normalize and remove batch dim for images
         if features[key]["dtype"] in ["image", "video"]:
             ep_stats[key] = {
                 k: v if k == "count" else np.squeeze(v / 255.0, axis=0) for k, v in ep_stats[key].items()
